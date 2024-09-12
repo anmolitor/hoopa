@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
 use std::net::TcpListener;
-use std::os::fd::{AsFd, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::{io, ptr};
@@ -94,23 +94,21 @@ pub fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct SubmissionHandler<'a> {
-    queue: SubmissionQueue<'a>,
-    backlog: &'a mut VecDeque<squeue::Entry>,
+fn submit(
+    entry: squeue::Entry,
+    queue: &mut squeue::SubmissionQueue,
+    backlog: &mut VecDeque<squeue::Entry>,
     token_index: usize,
-}
-
-impl<'a> SubmissionHandler<'a> {
-    fn submit(&mut self, entry: squeue::Entry) {
-        let entry = entry.user_data(self.token_index as _);
-        unsafe {
-            if self.queue.push(&entry).is_err() {
-                self.backlog.push_back(entry);
-            }
+) {
+    let entry = entry.user_data(token_index as _);
+    unsafe {
+        if queue.push(&entry).is_err() {
+            backlog.push_back(entry);
         }
     }
 }
 
+#[derive(Debug)]
 enum Error<'a> {
     ReadFromSocketFailed(Fd),
     InvalidHttpRequest(httparse::Error),
@@ -125,8 +123,10 @@ enum Error<'a> {
 fn event_loop<'a>(
     token: &'a mut ConnectionScopedToken,
     ret: i32,
-    submission_handler: &'a mut SubmissionHandler,
-    allocator: &'a mut Slab<&[u8]>,
+    queue: &mut squeue::SubmissionQueue,
+    backlog: &mut VecDeque<squeue::Entry>,
+    token_index: usize,
+    allocator: &'a mut Slab<Box<[u8]>>,
 ) -> Result<(), Error<'a>> {
     replace_with::replace_with_or_abort_and_return(token, |token| match token {
         ConnectionScopedToken::Read { fd, buf_index } => {
@@ -215,9 +215,9 @@ fn event_loop<'a>(
             )
             .build();
 
-            submission_handler.submit(write_e);
-            submission_handler.submit(splice_file_to_pipe);
-            submission_handler.submit(splice_pipe_to_socket);
+            submit(write_e, queue, backlog, token_index);
+            submit(splice_file_to_pipe, queue, backlog, token_index);
+            submit(splice_pipe_to_socket, queue, backlog, token_index);
 
             (
                 Ok(()),
@@ -260,14 +260,15 @@ fn event_loop<'a>(
     })
 }
 
-const RESPONSE: &str = "HTTP/1.1 200 OK\r\n\r\nHello World";
+const RESPONSE: &str = "HTTP/1.1 200 OK\r\n\r\n";
 
 fn worker(listener_fd: i32, thread_id: usize) -> anyhow::Result<()> {
     let mut ring = IoUring::new(256)?;
 
+    let mut allocator: Slab<Box<[u8]>> = Slab::with_capacity(64);
+
     let mut backlog = VecDeque::new();
     let mut bufpool = Vec::with_capacity(64);
-    let mut buf_alloc = Slab::with_capacity(64);
     let mut token_alloc = Slab::with_capacity(64);
 
     let (submitter, mut sq, mut cq) = ring.split();
@@ -325,180 +326,40 @@ fn worker(listener_fd: i32, thread_id: usize) -> anyhow::Result<()> {
                     accept.count += 1;
 
                     let fd = ret;
-                    let poll_token = token_alloc.insert(Token::Poll { fd });
+                    let token_index = token_alloc.insert(Token::Poll { fd });
 
-                    let poll_e = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
-                        .build()
-                        .user_data(poll_token as _);
+                    let poll_e = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _).build();
 
-                    unsafe {
-                        if sq.push(&poll_e).is_err() {
-                            backlog.push_back(poll_e);
-                        }
-                    }
+                    submit(poll_e, &mut sq, &mut backlog, token_index);
                 }
                 Token::Poll { fd } => {
                     let (buf_index, buf) = match bufpool.pop() {
-                        Some(buf_index) => (buf_index, &mut buf_alloc[buf_index]),
+                        Some(buf_index) => (buf_index, &mut allocator[buf_index]),
                         None => {
-                            let buf = vec![0u8; 2048].into_boxed_slice();
-                            let buf_entry = buf_alloc.vacant_entry();
+                            let buf_entry = allocator.vacant_entry();
                             let buf_index = buf_entry.key();
-                            (buf_index, buf_entry.insert(buf))
+                            (buf_index, buf_entry.insert(Box::new([0u8; 2048])))
                         }
                     };
 
-                    *token = Token::Read { fd, buf_index };
+                    let fd = unsafe { Fd::from_raw_fd(*fd) };
+                    let read_e =
+                        opcode::Recv::new(types::Fd::from(&fd), buf.as_mut_ptr(), buf.len() as _)
+                            .build();
+                    *token = Token::Conn(ConnectionScopedToken::Read { fd, buf_index });
 
-                    let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
-                        .build()
-                        .user_data(token_index as _);
-
-                    unsafe {
-                        if sq.push(&read_e).is_err() {
-                            backlog.push_back(read_e);
-                        }
-                    }
+                    submit(read_e, &mut sq, &mut backlog, token_index);
                 }
-                Token::Read { fd, buf_index } => {
-                    if ret == 0 {
-                        bufpool.push(buf_index);
-                        token_alloc.remove(token_index);
-
-                        unsafe {
-                            libc::close(fd);
-                        }
-                    } else {
-                        let len = ret as usize;
-                        let mut headers = [httparse::EMPTY_HEADER; 16];
-                        let mut req = httparse::Request::new(&mut headers);
-                        let res = req.parse(&buf_alloc[buf_index][0..len]).unwrap();
-                        println!("RES: {:?}, REQ: {:?}", res, req);
-                        let path = req.path.unwrap_or("index.html");
-                        let (file_length, file) = match std::fs::File::open(path) {
-                            Err(err) => {
-                                panic!("File not found!");
-                            }
-                            Ok(file) => {
-                                let length = file.metadata()?.len();
-                                (length, file)
-                            }
-                        };
-                        let file_fd: OwnedFd = file.into();
-                        let len = RESPONSE.len();
-                        println!("file found! {file_length}");
-                        let (reader_pipe, writer_pipe) = nix::unistd::pipe()?;
-                        let splice_e = opcode::Splice::new(
-                            types::Fd(file_fd.as_raw_fd()),
-                            0,
-                            types::Fd(writer_pipe.as_raw_fd()),
-                            -1,
-                            file_length as _,
-                        )
-                        .build()
-                        .flags(Flags::IO_LINK)
-                        .user_data(token_index as _);
-
-                        let splite_e_2 = opcode::Splice::new(
-                            types::Fd(reader_pipe.as_raw_fd()),
-                            -1,
-                            types::Fd(fd),
-                            -1,
-                            file_length as _,
-                        )
-                        .build()
-                        .user_data(token_index as _);
-
-                        if let Some(buf) = buf_alloc.get_mut(buf_index) {
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    RESPONSE.as_ptr(),
-                                    buf.as_mut_ptr(),
-                                    RESPONSE.len(),
-                                );
-                            }
-                        }
-                        let buf = &buf_alloc[buf_index];
-
-                        *token = Token::Write {
-                            fd,
-                            buf_index,
-                            len,
-                            offset: 0,
-                            tasks: 3,
-                            file_handle: Rc::new([file_fd, reader_pipe, writer_pipe]),
-                        };
-
-                        let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
-                            .build()
-                            .flags(Flags::IO_LINK)
-                            .user_data(token_index as _);
-                        let entries = [write_e, splice_e, splite_e_2];
-
-                        unsafe {
-                            if sq.push_multiple(&entries).is_err() {
-                                //backlog.push_back(entries[0]);
-                                //backlog.push_back(entries[1]);
-                            }
-                        }
-                    }
-                }
-                Token::Write {
-                    fd,
-                    buf_index,
-                    offset,
-                    len,
-                    tasks,
-                    file_handle,
-                } => {
-                    let write_len = ret as usize;
-
-                    if offset + write_len >= len {
-                        bufpool.push(buf_index);
-
-                        //*token = Token::Poll { fd };
-                        if tasks <= 1 {
-                            unsafe {
-                                libc::close(fd);
-                            }
-                            continue;
-                        }
-                        *token = Token::Write {
-                            fd,
-                            buf_index,
-                            offset,
-                            len,
-                            tasks: tasks - 1,
-                            file_handle,
-                        };
-
-                        // opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
-                        //     .build()
-                        //     .user_data(token_index as _)
-                    } else {
-                        let offset = offset + write_len;
-                        let len = len - offset;
-
-                        let buf = &buf_alloc[buf_index][offset..];
-
-                        *token = Token::Write {
-                            fd,
-                            buf_index,
-                            offset,
-                            len,
-                            tasks,
-                            file_handle,
-                        };
-
-                        let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), len as _)
-                            .build()
-                            .user_data(token_index as _);
-                        unsafe {
-                            if sq.push(&entry).is_err() {
-                                backlog.push_back(entry);
-                            }
-                        }
-                    };
+                Token::Conn(conn) => {
+                    event_loop(
+                        conn,
+                        ret,
+                        &mut sq,
+                        &mut backlog,
+                        token_index,
+                        &mut allocator,
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -524,6 +385,12 @@ struct Fd(OwnedFd);
 impl AsRawFd for Fd {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
+    }
+}
+
+impl FromRawFd for Fd {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Fd(OwnedFd::from_raw_fd(fd))
     }
 }
 
