@@ -1,0 +1,21 @@
+[package]
+name = "io_uring_tcp"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+io-uring = "0.6"
+anyhow = "1"
+slab = "0.4"
+libc = { version = "0.2.98", default-features = false }
+num_cpus = "1.16"
+httparse = "1.9.4"
+replace_with = "0.1.7"
+nix = "0.29"
+# hyper/tokio version
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
