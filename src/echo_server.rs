@@ -11,18 +11,20 @@ use io_uring::squeue::Flags;
 use io_uring::{opcode, squeue, types, IoUring, SubmissionQueue};
 use slab::Slab;
 
-#[derive(Debug)]
+use crate::fd::Fd;
+use crate::http2::{Frame, FrameType, Setting, SettingPairs, StreamId};
+
+#[derive(Debug, Clone)]
 enum Token {
     Accept,
-    Poll { fd: RawFd },
-    Conn(ConnectionScopedToken),
-}
-
-#[derive(Debug)]
-enum ConnectionScopedToken {
+    Poll {
+        fd: Fd,
+        http2: bool,
+    },
     Read {
         fd: Fd,
         buf_index: usize,
+        http2: bool,
     },
     WriteFileHttpPrefix {
         fd: Fd,
@@ -118,83 +120,153 @@ enum Error<'a> {
     FailedToGetFileMetadata(&'a str, io::Error),
     NotAFile(&'a str),
     FailedToCreatePipe(nix::Error),
+    NoHttp2Preface(&'a [u8]),
 }
 
 fn event_loop<'a>(
-    token: &'a mut ConnectionScopedToken,
     ret: i32,
     queue: &mut squeue::SubmissionQueue,
     backlog: &mut VecDeque<squeue::Entry>,
     token_index: usize,
+    token_allocator: &'a mut Slab<Token>,
     allocator: &'a mut Slab<Box<[u8]>>,
+    accept: &mut AcceptCount,
 ) -> Result<(), Error<'a>> {
-    replace_with::replace_with_or_abort_and_return(token, |token| match token {
-        ConnectionScopedToken::Read { fd, buf_index } => {
+    let token = &mut (token_allocator[token_index]);
+    println!("Token {token:?}, ret {ret}");
+    match token.clone() {
+        Token::Accept => {
+            accept.count += 1;
+
+            let fd = unsafe { Fd::from_raw_fd(ret) };
+
+            let poll_e = opcode::PollAdd::new(types::Fd::from(&fd), libc::POLLIN as _).build();
+            let token_index = token_allocator.insert(Token::Poll { fd, http2: false });
+
+            submit(poll_e, queue, backlog, token_index);
+
+            Ok(())
+        }
+        Token::Poll { fd, http2 } => {
+            let entry = allocator.vacant_entry();
+            let buf_index = entry.key();
+            let buf = entry.insert(Box::new([0u8; 2048]));
+
+            let read_e =
+                opcode::Recv::new(types::Fd::from(&fd), buf.as_mut_ptr(), buf.len() as _).build();
+
+            submit(read_e, queue, backlog, token_index);
+            *token = Token::Read {
+                fd,
+                buf_index,
+                http2,
+            };
+            Ok(())
+        }
+        Token::Read {
+            fd,
+            buf_index,
+            http2,
+        } => {
             if ret == 0 {
-                return (
-                    Err(Error::ReadFromSocketFailed(fd)),
-                    ConnectionScopedToken::CloseConnection,
-                );
+                return Err(Error::ReadFromSocketFailed(fd));
             }
             let len = ret as usize;
+            let buf = &mut allocator[buf_index][0..len];
+            println!("Buf: {}", String::from_utf8_lossy(buf));
+
+            if http2 {
+                let Some(buf) = buf.strip_prefix(PREFACE_HTTP2) else {
+                    return Err(Error::NoHttp2Preface(buf));
+                };
+                // let setting_payload = {
+                //     SettingPairs(&[
+                //         (Setting::EnablePush, 0),
+                //         (Setting::HeaderTableSize, s.header_table_size),
+                //         (Setting::InitialWindowSize, s.initial_window_size),
+                //         (
+                //             Setting::MaxConcurrentStreams,
+                //             s.max_concurrent_streams.unwrap_or(u32::MAX),
+                //         ),
+                //         (Setting::MaxFrameSize, s.max_frame_size),
+                //         (Setting::MaxHeaderListSize, s.max_header_list_size),
+                //     ])
+                //     .into_piece(&mut self.out_scratch)
+                //     .map_err(ServeError::DownstreamWrite)?
+                // };
+                let frame = Frame::new(
+                    FrameType::Settings(Default::default()),
+                    StreamId::CONNECTION,
+                );
+                println!("Buf without preface {buf:?}");
+            }
+
             let mut headers = [httparse::EMPTY_HEADER; 16];
             let mut req = httparse::Request::new(&mut headers);
-            let res = match req.parse(&allocator[buf_index][0..len]) {
+            let res = match req.parse(buf) {
                 Err(err) => {
-                    return (
-                        Err(Error::InvalidHttpRequest(err)),
-                        ConnectionScopedToken::CloseConnection,
-                    );
+                    return Err(Error::InvalidHttpRequest(err));
                 }
                 Ok(ok) => ok,
             };
+            if req.headers.contains(&httparse::Header {
+                name: "Upgrade",
+                value: b"h2c",
+            }) {
+                println!("Upgrading to http2");
+                let write_e = opcode::Send::new(
+                    types::Fd::from(&fd),
+                    RESPONSE_101_UPGRADE_HTTP2.as_ptr(),
+                    RESPONSE_101_UPGRADE_HTTP2.len() as _,
+                )
+                .build();
+
+                let poll_e = opcode::PollAdd::new(types::Fd::from(&fd), libc::POLLIN as _).build();
+                *token = Token::Poll { fd, http2: true };
+
+                submit(write_e, queue, backlog, token_index);
+                submit(poll_e, queue, backlog, token_index);
+
+                return Ok(());
+            }
             let path = match parse_path(req.path) {
                 Ok(ok) => ok,
                 Err(err) => {
-                    return (Err(err), ConnectionScopedToken::CloseConnection);
+                    return Err(err);
                 }
             };
             let file = match std::fs::File::open(path) {
                 Err(err) => {
-                    return (
-                        Err(Error::FileNotFound(path, err)),
-                        ConnectionScopedToken::CloseConnection,
-                    );
+                    return Err(Error::FileNotFound(path, err));
                 }
                 Ok(ok) => ok,
             };
             let metadata = match file.metadata() {
                 Err(err) => {
-                    return (
-                        Err(Error::FailedToGetFileMetadata(path, err)),
-                        ConnectionScopedToken::CloseConnection,
-                    );
+                    return Err(Error::FailedToGetFileMetadata(path, err));
                 }
                 Ok(ok) => ok,
             };
             if !metadata.is_file() {
-                return (
-                    Err(Error::NotAFile(path)),
-                    ConnectionScopedToken::CloseConnection,
-                );
+                return Err(Error::NotAFile(path));
             }
 
             let (pipe_read, pipe_write) = match nix::unistd::pipe() {
                 Err(err) => {
-                    return (
-                        Err(Error::FailedToCreatePipe(err)),
-                        ConnectionScopedToken::CloseConnection,
-                    );
+                    return Err(Error::FailedToCreatePipe(err));
                 }
-                Ok((r, w)) => (Fd(r), (Fd(w))),
+                Ok((r, w)) => (Fd::from(r), (Fd::from(w))),
             };
 
             let file_handle = Fd::from(file);
 
-            let write_e =
-                opcode::Send::new(types::Fd::from(&fd), RESPONSE.as_ptr(), RESPONSE.len() as _)
-                    .build()
-                    .flags(Flags::IO_LINK);
+            let write_e = opcode::Send::new(
+                types::Fd::from(&fd),
+                RESPONSE_200_HTTP11.as_ptr(),
+                RESPONSE_200_HTTP11.len() as _,
+            )
+            .build()
+            .flags(Flags::IO_LINK);
 
             let splice_file_to_pipe = opcode::Splice::new(
                 types::Fd::from(&file_handle),
@@ -219,48 +291,49 @@ fn event_loop<'a>(
             submit(splice_file_to_pipe, queue, backlog, token_index);
             submit(splice_pipe_to_socket, queue, backlog, token_index);
 
-            (
-                Ok(()),
-                ConnectionScopedToken::WriteFileHttpPrefix {
-                    fd,
-                    file_handle,
-                    pipe_read,
-                    pipe_write,
-                },
-            )
-        }
-        ConnectionScopedToken::WriteFileHttpPrefix {
-            fd,
-            file_handle,
-            pipe_read,
-            pipe_write,
-        } => (
-            Ok(()),
-            ConnectionScopedToken::WriteFileToPipe {
+            *token = Token::WriteFileHttpPrefix {
                 fd,
                 file_handle,
                 pipe_read,
                 pipe_write,
-            },
-        ),
-        ConnectionScopedToken::WriteFileToPipe {
+            };
+            Ok(())
+        }
+        Token::WriteFileHttpPrefix {
+            fd,
+            file_handle,
+            pipe_read,
+            pipe_write,
+        } => {
+            *token = Token::WriteFileToPipe {
+                fd,
+                file_handle,
+                pipe_read,
+                pipe_write,
+            };
+            Ok(())
+        }
+        Token::WriteFileToPipe {
             fd,
             file_handle: _,
             pipe_read,
             pipe_write: _,
-        } => (
-            Ok(()),
-            ConnectionScopedToken::WritePipeToSocket { fd, pipe_read },
-        ),
-        ConnectionScopedToken::WritePipeToSocket {
+        } => {
+            *token = Token::WritePipeToSocket { fd, pipe_read };
+            Ok(())
+        }
+        Token::WritePipeToSocket {
             fd: _,
             pipe_read: _,
-        } => (Ok(()), ConnectionScopedToken::CloseConnection),
-        ConnectionScopedToken::CloseConnection => (Ok(()), ConnectionScopedToken::CloseConnection),
-    })
+        } => Ok(()),
+        Token::CloseConnection => Ok(()),
+    }
 }
 
-const RESPONSE: &str = "HTTP/1.1 200 OK\r\n\r\n";
+const RESPONSE_200_HTTP11: &str = "HTTP/1.1 200 OK\r\n\r\n";
+const RESPONSE_101_UPGRADE_HTTP2: &str =
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+pub const PREFACE_HTTP2: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 fn worker(listener_fd: i32, thread_id: usize) -> anyhow::Result<()> {
     let mut ring = IoUring::new(256)?;
@@ -268,7 +341,6 @@ fn worker(listener_fd: i32, thread_id: usize) -> anyhow::Result<()> {
     let mut allocator: Slab<Box<[u8]>> = Slab::with_capacity(64);
 
     let mut backlog = VecDeque::new();
-    let mut bufpool = Vec::with_capacity(64);
     let mut token_alloc = Slab::with_capacity(64);
 
     let (submitter, mut sq, mut cq) = ring.split();
@@ -319,49 +391,15 @@ fn worker(listener_fd: i32, thread_id: usize) -> anyhow::Result<()> {
                 continue;
             }
 
-            let token = &mut token_alloc[token_index];
-            println!("Token: {token:?}, ret {ret}, token_index {token_index}");
-            match token {
-                Token::Accept => {
-                    accept.count += 1;
-
-                    let fd = ret;
-                    let token_index = token_alloc.insert(Token::Poll { fd });
-
-                    let poll_e = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _).build();
-
-                    submit(poll_e, &mut sq, &mut backlog, token_index);
-                }
-                Token::Poll { fd } => {
-                    let (buf_index, buf) = match bufpool.pop() {
-                        Some(buf_index) => (buf_index, &mut allocator[buf_index]),
-                        None => {
-                            let buf_entry = allocator.vacant_entry();
-                            let buf_index = buf_entry.key();
-                            (buf_index, buf_entry.insert(Box::new([0u8; 2048])))
-                        }
-                    };
-
-                    let fd = unsafe { Fd::from_raw_fd(*fd) };
-                    let read_e =
-                        opcode::Recv::new(types::Fd::from(&fd), buf.as_mut_ptr(), buf.len() as _)
-                            .build();
-                    *token = Token::Conn(ConnectionScopedToken::Read { fd, buf_index });
-
-                    submit(read_e, &mut sq, &mut backlog, token_index);
-                }
-                Token::Conn(conn) => {
-                    event_loop(
-                        conn,
-                        ret,
-                        &mut sq,
-                        &mut backlog,
-                        token_index,
-                        &mut allocator,
-                    )
-                    .unwrap();
-                }
-            }
+            event_loop(
+                ret,
+                &mut sq,
+                &mut backlog,
+                token_index,
+                &mut token_alloc,
+                &mut allocator,
+                &mut accept,
+            );
         }
     }
 }
@@ -376,34 +414,7 @@ fn parse_path<'a>(path: Option<&'a str>) -> Result<&'a str, Error<'a>> {
     if path.contains("..") {
         return Err(Error::PathContainedDotDot(path));
     }
-    return Ok(path);
-}
-
-#[derive(Debug)]
-struct Fd(OwnedFd);
-
-impl AsRawFd for Fd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-impl FromRawFd for Fd {
-    unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Fd(OwnedFd::from_raw_fd(fd))
-    }
-}
-
-impl From<&Fd> for types::Fd {
-    fn from(value: &Fd) -> Self {
-        types::Fd(value.0.as_raw_fd())
-    }
-}
-
-impl From<File> for Fd {
-    fn from(value: File) -> Self {
-        Fd(value.into())
-    }
+    Ok(path)
 }
 
 #[test]

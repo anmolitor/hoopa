@@ -6,11 +6,19 @@
 //     #[cfg(not(rust_analyzer))]
 //     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // }
+mod buf;
 mod echo_server;
+mod fd;
+mod hoopa;
+mod http2;
 mod hyper;
-//mod iouring;
+mod naive;
+mod slab;
+mod uring_id;
 
 fn main() -> anyhow::Result<()> {
-    echo_server::main().map_err(|err| anyhow::anyhow!(err))?;
+    hoopa::main().map_err(|err| anyhow::anyhow!(err))?;
+    //hyper::main().map_err(|err| anyhow::anyhow!(err))?;
+    //naive::main();
     Ok(())
 }
