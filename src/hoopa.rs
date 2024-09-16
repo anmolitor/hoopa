@@ -11,7 +11,6 @@ use crate::{
     uring_id::UringId,
 };
 use io_uring::{opcode, types, IoUring};
-use kanal::{Receiver, Sender};
 
 const MAX_CONCURRENT_REQUESTS_PER_THREAD: u16 = 512;
 const IO_URING_SIZE: u32 = 64;
@@ -103,12 +102,13 @@ fn accept_worker(socket_fd: i32, chans: &[(usize, RawFd)], cpu: usize) -> anyhow
                 tracing::debug!("Connection sent");
                 continue;
             }
-                
+
             let connection_fd: RawFd = completion.result();
             let (receiver_id, ring_fd) = chan_iter.next().expect("Empty slice of senders");
             let message_entry =
                 opcode::MsgRingData::new(types::Fd(*ring_fd), connection_fd, u64::MAX, None)
-                    .build().user_data(*receiver_id as _);
+                    .build()
+                    .user_data(*receiver_id as _);
             unsafe { sq.push(&message_entry)? };
             tracing::debug!(message = "Accepted connection", receiver = receiver_id);
         }
