@@ -1,7 +1,7 @@
 use std::{
     net::TcpListener,
-    os::fd::{AsRawFd, FromRawFd},
-    u32, u64,
+    os::fd::{AsRawFd, FromRawFd, RawFd},
+    u64,
 };
 
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
     uring_id::UringId,
 };
 use io_uring::{opcode, types, IoUring};
+use kanal::{Receiver, Sender};
 
 const MAX_CONCURRENT_REQUESTS_PER_THREAD: u16 = 512;
 const IO_URING_SIZE: u32 = 64;
@@ -35,16 +36,19 @@ pub fn main() -> anyhow::Result<()> {
     let cpus = num_cpus::get_physical();
 
     let mut handles = Vec::with_capacity(cpus - 1);
+    let mut rings = Vec::with_capacity(cpus - 1);
     for cpu in 1..cpus {
+        let worker_ring = setup_worker_io_uring()?;
+        rings.push((cpu, worker_ring.as_raw_fd()));
         let join_handle = std::thread::spawn(move || {
-            worker(socket_fd, cpu).expect("Worker failed");
+            worker(worker_ring, cpu).expect("Worker failed");
         });
         handles.push(join_handle);
     }
 
     tracing::info!(message = "Accepting requests.", threads = cpus, addr = %listener.local_addr()?);
 
-    let result = worker(socket_fd, 0);
+    let result = accept_worker(socket_fd, &rings, 0);
     for handle in handles {
         handle.join().expect("Join");
     }
@@ -52,11 +56,18 @@ pub fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn worker(socket_fd: i32, cpu: usize) -> anyhow::Result<()> {
+fn setup_worker_io_uring() -> std::io::Result<IoUring> {
+    IoUring::builder()
+        .setup_coop_taskrun()
+        //.setup_sqpoll(1024 * 1024)
+        .build(256)
+}
+
+fn accept_worker(socket_fd: i32, chans: &[(usize, RawFd)], cpu: usize) -> anyhow::Result<()> {
     let span = tracing::info_span!("", cpu = %cpu);
     let _enter = span.enter();
 
-    tracing::debug!(message = "Started worker");
+    tracing::debug!(message = "Started main worker");
 
     let mut ring: IoUring = IoUring::builder()
         .setup_coop_taskrun()
@@ -65,16 +76,56 @@ fn worker(socket_fd: i32, cpu: usize) -> anyhow::Result<()> {
         .build(256)?;
     let (submitter, mut sq, mut cq) = ring.split();
     tracing::debug!(message = "Setup io_uring");
-    let mut buffers: FixedBuffers<4096> = FixedBuffers::new(MAX_CONCURRENT_REQUESTS_PER_THREAD);
-    buffers.register_to(&submitter)?;
-    tracing::debug!(message = "Registered shared buffers");
 
-    let accept_multi_entry = opcode::AcceptMulti::new(types::Fd(socket_fd))
-        .build()
-        .user_data(u64::MAX);
+    let accept_multi_entry = opcode::AcceptMulti::new(types::Fd(socket_fd)).build();
     unsafe {
         sq.push(&accept_multi_entry)?;
     }
+
+    let mut chan_iter = chans.iter().cycle();
+
+    loop {
+        sq.sync();
+        let submit_result = submitter.submit_and_wait(1);
+        match submit_result {
+            Ok(_) => (),
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => (),
+            Err(err) => return Err(err.into()),
+        }
+
+        cq.sync();
+        for completion in &mut cq {
+            let user_data = completion.user_data();
+            let completion_span =
+                tracing::debug_span!("completion", user_data, result = completion.result());
+            let _enter = completion_span.enter();
+            if user_data > 0 {
+                tracing::debug!("Connection sent");
+                continue;
+            }
+                
+            let connection_fd: RawFd = completion.result();
+            let (receiver_id, ring_fd) = chan_iter.next().expect("Empty slice of senders");
+            let message_entry =
+                opcode::MsgRingData::new(types::Fd(*ring_fd), connection_fd, u64::MAX, None)
+                    .build().user_data(*receiver_id as _);
+            unsafe { sq.push(&message_entry)? };
+            tracing::debug!(message = "Accepted connection", receiver = receiver_id);
+        }
+    }
+}
+
+fn worker(mut ring: IoUring, cpu: usize) -> anyhow::Result<()> {
+    let span = tracing::info_span!("", cpu = %cpu);
+    let _enter = span.enter();
+
+    tracing::debug!(message = "Started worker");
+
+    let (submitter, mut sq, mut cq) = ring.split();
+    tracing::debug!(message = "Setup io_uring");
+    let mut buffers: FixedBuffers<4096> = FixedBuffers::new(MAX_CONCURRENT_REQUESTS_PER_THREAD);
+    buffers.register_to(&submitter)?;
+    tracing::debug!(message = "Registered shared buffers");
     let mut state: Slab<RequestState> = Slab::new(MAX_CONCURRENT_REQUESTS_PER_THREAD);
 
     loop {
@@ -94,7 +145,6 @@ fn worker(socket_fd: i32, cpu: usize) -> anyhow::Result<()> {
             let _enter = completion_span.enter();
 
             if user_data == u64::MAX {
-                // New connection just came in!
                 let connection_fd = unsafe { Fd::from_raw_fd(completion.result()) };
                 let (read_entry, storage_id) = buffers.read(&connection_fd)?;
                 let slab_id = state.insert(RequestState::Read {
@@ -105,7 +155,10 @@ fn worker(socket_fd: i32, cpu: usize) -> anyhow::Result<()> {
                 let id = UringId::from(user_id);
                 unsafe { sq.push(&read_entry.user_data(id.user_data()))? };
                 tracing::debug!("Reading from socket");
+
+                continue;
             }
+
             let id = UringId(user_data);
 
             let user_id = id.user_id();
@@ -142,8 +195,6 @@ fn worker(socket_fd: i32, cpu: usize) -> anyhow::Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 const RESPONSE_200_HTTP11: &str = "HTTP/1.1 200 OK\r\n\r\nHello World";
