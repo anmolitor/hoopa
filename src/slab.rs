@@ -1,47 +1,16 @@
 use std::{fmt::Display, marker::PhantomData};
 
-pub struct Slab<T> {
+#[derive(Debug)]
+pub struct Slab<K, T> {
     storage: Vec<Option<T>>,
     next: u16,
     free_list: Vec<u16>,
+    _key_type: PhantomData<K>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     StorageFull,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SlabId<T>(u16, PhantomData<T>);
-
-impl<T> From<u16> for SlabId<T> {
-    fn from(value: u16) -> Self {
-        Self(value, PhantomData)
-    }
-}
-
-impl<T> From<SlabId<T>> for u16 {
-    fn from(value: SlabId<T>) -> Self {
-        value.0
-    }
-}
-
-impl<T> From<SlabId<T>> for u32 {
-    fn from(value: SlabId<T>) -> Self {
-        value.0.into()
-    }
-}
-
-impl<T> From<SlabId<T>> for u64 {
-    fn from(value: SlabId<T>) -> Self {
-        value.0.into()
-    }
-}
-
-impl<T> From<SlabId<T>> for usize {
-    fn from(value: SlabId<T>) -> Self {
-        value.0.into()
-    }
 }
 
 impl Display for Error {
@@ -55,22 +24,38 @@ impl Display for Error {
 impl std::error::Error for Error {}
 
 #[must_use]
-pub struct Entry<'a, T> {
-    key: SlabId<T>,
-    slab: &'a mut Slab<T>,
+pub struct Entry<'a, K, T>
+where
+    K: Into<u16> + Copy,
+{
+    key: K,
+    slab: &'a mut Slab<K, T>,
+    set: bool,
 }
 
-impl<'a, T> Entry<'a, T> {
-    pub fn remove(self) {
+impl<'a, K, T> Entry<'a, K, T>
+where
+    K: Into<u16> + Copy,
+{
+    pub fn set(mut self, value: T) {
+        self.slab.storage[Into::<u16>::into(self.key) as usize] = Some(value);
+        self.set = true;
+    }
+}
+
+impl<'a, K, T> Drop for Entry<'a, K, T>
+where
+    K: Into<u16> + Copy,
+{
+    fn drop(&mut self) {
+        if self.set {
+            return;
+        }
         self.slab.remove(self.key);
     }
-
-    pub fn set(self, value: T) {
-        self.slab.storage[self.key.0 as usize] = Some(value);
-    }
 }
 
-impl<T> Slab<T> {
+impl<K, T> Slab<K, T> {
     pub fn new(capacity: u16) -> Self {
         if capacity == 0 {
             panic!("capacity should be at least one.");
@@ -83,25 +68,61 @@ impl<T> Slab<T> {
             storage,
             next: capacity,
             free_list: Default::default(),
+            _key_type: PhantomData,
         }
     }
 
-    pub fn insert(&mut self, value: T) -> Result<SlabId<T>, Error> {
+    pub fn insert(&mut self, value: T) -> Result<K, Error>
+    where
+        K: From<u16>,
+    {
         let id = self.next()?;
         self.storage[id as usize] = Some(value);
-        Ok(SlabId(id, PhantomData))
+        Ok(K::from(id))
     }
 
-    pub fn remove(&mut self, key: SlabId<T>) -> Option<T> {
-        let value = self.storage.get_mut(key.0 as usize)?;
-        self.free_list.push(key.0);
+    pub fn reserve(&mut self) -> Result<(K, Entry<K, T>), Error>
+    where
+        K: From<u16> + Into<u16> + Copy,
+    {
+        let id = self.next()?;
+
+        let key = K::from(id);
+        Ok((
+            key,
+            Entry {
+                key,
+                slab: self,
+                set: false,
+            },
+        ))
+    }
+
+    pub fn remove(&mut self, key: K) -> Option<T>
+    where
+        K: Into<u16> + Copy,
+    {
+        let key = Into::<u16>::into(key);
+        let value = self.storage.get_mut(key as usize)?;
+        self.free_list.push(key);
         value.take()
     }
 
-    pub fn entry(&mut self, key: SlabId<T>) -> Option<(T, Entry<T>)> {
-        let value = self.storage.get_mut(key.0 as usize)?;
+    pub fn entry(&mut self, key: K) -> Option<(T, Entry<K, T>)>
+    where
+        K: Into<u16> + Copy,
+    {
+        let k = Into::<u16>::into(key);
+        let value = self.storage.get_mut(k as usize)?;
         let value = value.take()?;
-        Some((value, Entry { key, slab: self }))
+        Some((
+            value,
+            Entry {
+                key,
+                slab: self,
+                set: false,
+            },
+        ))
     }
 
     fn next(&mut self) -> Result<u16, Error> {

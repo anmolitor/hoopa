@@ -1,8 +1,11 @@
 use std::fmt::Display;
 
-use io_uring::{types, IoUring};
+use io_uring::{opcode, types, IoUring};
 
-use crate::fd::Fd;
+use crate::{
+    fd::Fd,
+    uring_id::{Op as _, UringId},
+};
 
 pub struct FixedBuffers<const N: usize> {
     storage: Vec<[u8; N]>,
@@ -85,79 +88,39 @@ impl<const N: usize> FixedBuffers<N> {
         }
     }
 
-    pub fn read(&mut self, fd: &Fd) -> Result<(io_uring::squeue::Entry, StorageId), Error> {
+    pub fn read(
+        &mut self,
+        fd: &Fd,
+        uring_id: UringId,
+    ) -> Result<(io_uring::squeue::Entry, StorageId), Error> {
         let buf_index = self.next()?;
-        let read_entry = io_uring::opcode::ReadFixed::new(
-            types::Fd::from(fd),
-            self.storage[buf_index as usize].as_mut_ptr(),
-            N as _,
-            buf_index,
-        )
-        .build();
-        Ok((read_entry, StorageId(buf_index)))
+        let storage_id = StorageId(buf_index);
+        let read_entry = self.read_into(fd, storage_id, uring_id);
+        Ok((read_entry, storage_id))
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        ffi::CString,
-        fs::File,
-        io::Read,
-        os::fd::{AsRawFd, FromRawFd},
-        time::Instant,
-    };
-
-    use crate::uring_id::UringId;
-
-    use super::*;
-
-    #[test]
-    fn read_test() -> anyhow::Result<()> {
-        let user_data = 123456u32;
-        let uring_id = UringId::from(user_data);
-        let mut buf: FixedBuffers<1024> = FixedBuffers::new(10);
-        let mut ring = io_uring::IoUring::new(4)?;
-        let cargo_lock = CString::new("Cargo.lock").expect("CString");
-
-        let time_start = Instant::now();
-        let open_at = io_uring::opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), cargo_lock.as_ptr())
-            .flags(libc::O_CLOEXEC | libc::O_RDONLY)
-            .build()
-            .user_data(uring_id.user_data());
-        let uring_id = uring_id.increment();
-        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
-        let statx_entry = io_uring::opcode::Statx::new(
-            types::Fd(libc::AT_FDCWD),
-            cargo_lock.as_ptr(),
-            &mut statx as *mut libc::statx as *mut _,
+    fn read_into(
+        &mut self,
+        fd: &Fd,
+        storage_id: StorageId,
+        uring_id: UringId,
+    ) -> io_uring::squeue::Entry {
+        io_uring::opcode::ReadFixed::new(
+            types::Fd::from(fd),
+            self[storage_id].as_mut_ptr(),
+            N as _,
+            storage_id.0,
         )
-        .build()
-        .user_data(uring_id.user_data());
-        unsafe {
-            ring.submission().push(&open_at)?;
-            ring.submission().push(&statx_entry)?;
-        };
+        .build_with_user_data(uring_id)
+    }
 
-        ring.submit_and_wait(2)?;
-        let mut opened_file = ring.completion().next().expect("Number of read bytes");
-        let mut stats = ring.completion().next().expect("Number of read bytes");
-        println!("{opened_file:?} {stats:?}");
-        if UringId(stats.user_data()).call_id() == 0 {
-            std::mem::swap(&mut opened_file, &mut stats);
-        }
-        println!("{opened_file:?}");
-        println!("{stats:?}, stats: {statx:?}",);
-        let file_fd = unsafe { Fd::from_raw_fd(opened_file.result()) };
-        let (entry, storage_id) = buf.read(&file_fd)?;
-        unsafe { ring.submission().push(&entry) }?;
-
-        ring.submit_and_wait(1)?;
-        let read_bytes = ring.completion().next().expect("Number of read bytes");
-
-        println!("{}", String::from_utf8_lossy(&buf[storage_id]));
-        let time = Instant::now().duration_since(time_start);
-        println!("Time: {time:?}");
-        Ok(())
+    pub fn write(
+        &self,
+        connection_fd: &Fd,
+        storage_id: StorageId,
+        len: u32,
+    ) -> io_uring::squeue::Entry {
+        let buf = &self[storage_id];
+        io_uring::opcode::Write::new(types::Fd::from(connection_fd), buf.as_ptr(), len).build()
     }
 }

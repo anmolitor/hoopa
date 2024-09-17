@@ -402,7 +402,7 @@ impl Frame {
         Ok((i, frame))
     }
 
-    pub fn write_into(self, mut w: impl std::io::Write) -> std::io::Result<()> {
+    pub fn write_into(self, mut w: &mut [u8]) -> std::io::Result<u8> {
         use byteorder::{BigEndian, WriteBytesExt};
         w.write_u24::<BigEndian>(self.len as _)?;
         let ft = self.frame_type.encode();
@@ -410,7 +410,7 @@ impl Frame {
         w.write_u8(ft.flags)?;
         w.write_all(&pack_reserved_and_stream_id(self.reserved, self.stream_id))?;
 
-        Ok(())
+        Ok(9)
     }
 
     /// Returns true if this frame is an ack
@@ -926,12 +926,17 @@ impl<const N: usize> From<&'static [(Setting, u32); N]> for SettingPairs<'static
 }
 
 impl<'a> SettingPairs<'a> {
-    pub fn into_piece(self, mut slice: &mut [u8]) -> std::io::Result<()> {
+    pub fn write(self, mut slice: &mut [u8]) -> std::io::Result<()> {
         for (id, value) in self.0.iter() {
             slice.write_u16::<BigEndian>(*id as u16)?;
             slice.write_u32::<BigEndian>(*value)?;
         }
+
         Ok(())
+    }
+
+    pub fn calc_size(&self) -> usize {
+        self.0.len() * 6
     }
 }
 
