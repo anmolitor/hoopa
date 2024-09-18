@@ -8,6 +8,6 @@ Rough architecture:
     together and possibly linked in order via the IO_LINK flag
 - Each thread allocates a big chunk of contiguous memory at the start of the program.
   Afterwards, each request gets a part of that memory to allocate into.
-  The memory is probably registered with the kernel via io_uring register_buffers (TODO)
+  The memory is registered with the kernel via io_uring register_buf_ring
 - HTTP2 is supported and connections are kept around for re-use.
       

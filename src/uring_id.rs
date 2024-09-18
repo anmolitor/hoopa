@@ -47,8 +47,10 @@ pub struct StreamId(u32);
 #[derive(Copy, Clone, Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum OpCode {
+    AcceptMulti = opcode::AcceptMulti::CODE,
     RecvMulti = opcode::RecvMulti::CODE,
-    ReadFixed = opcode::ReadFixed::CODE,
+    Send = opcode::Send::CODE,
+    AsyncCancel = opcode::AsyncCancel::CODE,
 }
 
 pub struct UringIdOutOfRange<T>(T);
@@ -56,6 +58,10 @@ pub struct UringIdOutOfRange<T>(T);
 impl UringId {
     pub fn from_cqe(entry: &cqueue::Entry) -> Self {
         UringId(entry.user_data())
+    }
+
+    pub fn cancel(self) -> squeue::Entry {
+        opcode::AsyncCancel::new(self.0).build_with_user_data(self)
     }
     pub fn from_connection_id(connection_id: ConnectionId) -> Self {
         let id = u64::from(connection_id.0) << 48;
@@ -125,9 +131,49 @@ pub trait Op {
     }
 }
 
-impl Op for opcode::ReadFixed {
+// impl Op for opcode::ReadFixed {
+//     fn code() -> OpCode {
+//         OpCode::ReadFixed
+//     }
+
+//     fn build(self) -> squeue::Entry {
+//         self.build()
+//     }
+// }
+
+impl Op for opcode::AcceptMulti {
     fn code() -> OpCode {
-        OpCode::ReadFixed
+        OpCode::AcceptMulti
+    }
+
+    fn build(self) -> squeue::Entry {
+        self.build()
+    }
+}
+
+impl Op for opcode::Send {
+    fn code() -> OpCode {
+        OpCode::Send
+    }
+
+    fn build(self) -> squeue::Entry {
+        self.build()
+    }
+}
+
+impl Op for opcode::RecvMulti {
+    fn code() -> OpCode {
+        OpCode::RecvMulti
+    }
+
+    fn build(self) -> squeue::Entry {
+        self.build()
+    }
+}
+
+impl Op for opcode::AsyncCancel {
+    fn code() -> OpCode {
+        OpCode::AsyncCancel
     }
 
     fn build(self) -> squeue::Entry {
@@ -150,8 +196,10 @@ impl Display for StreamId {
 impl Display for OpCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str_repr = match self {
+            OpCode::AcceptMulti => "AcceptMulti",
+            OpCode::AsyncCancel => "AsyncCancel",
             OpCode::RecvMulti => "RecvMulti",
-            OpCode::ReadFixed => "ReadFixed",
+            OpCode::Send => "Send",
         };
         f.write_str(str_repr)
     }
@@ -180,7 +228,7 @@ mod tests {
     #[test]
     fn test_set_op_code() {
         let conn_id = ConnectionId(0x1234);
-        let op_code = OpCode::ReadFixed;
+        let op_code = OpCode::RecvMulti;
         let uring_id = UringId::from_connection_id(conn_id).set_op_code(op_code);
         assert_eq!(uring_id.op_code(), op_code);
     }

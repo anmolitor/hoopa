@@ -1,3 +1,5 @@
+// Copied from https://github.com/bearcove/loona for experimentation.
+
 //! HTTP/2 parser
 //!
 //! HTTP/2 <https://httpwg.org/specs/rfc9113.html>

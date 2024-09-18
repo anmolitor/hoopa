@@ -7,18 +7,16 @@
 //     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // }
 mod buf;
-mod echo_server;
+mod completion_result;
 mod fd;
 mod hoopa;
 mod http2;
 mod hyper;
-mod naive;
 mod slab;
 mod uring_id;
 
 fn main() -> anyhow::Result<()> {
     hoopa::main().map_err(|err| anyhow::anyhow!(err))?;
-    //hyper::main().map_err(|err| anyhow::anyhow!(err))?;
-    //naive::main();
+    // hyper::main().map_err(|err| anyhow::anyhow!(err))?;
     Ok(())
 }
