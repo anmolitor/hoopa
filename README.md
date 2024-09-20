@@ -1,6 +1,7 @@
 # Outperforming nginx at static file serving
 
 Rough architecture:
+```
        _________________
       |                 |   AcceptMulti     __________           _____________
       |                 | ---------------> |          |         |             |        
@@ -26,7 +27,7 @@ Rough architecture:
       |                 | ---------------> |          |         |             |        
       |_________________| <--------------- |__________|         |_____________|                 
                               Success!
-
+```
       
           
 
