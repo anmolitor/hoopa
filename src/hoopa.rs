@@ -13,6 +13,7 @@ use crate::{
     uring_id::{ConnectionId, Op as _, OpCode, UringId},
 };
 use io_uring::{opcode, types, IoUring};
+use nix::sys::epoll::{EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use tracing::field;
 
 const MAX_CONCURRENT_REQUESTS_PER_THREAD: u16 = 512;
@@ -25,7 +26,8 @@ struct RequestState {
 
 pub fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let listener = TcpListener::bind(("127.0.0.1", 3456))?;
+    //let listener = TcpListener::bind(("127.0.0.1", 3456))?;
+    let listener = TcpListener::bind(("0.0.0.0", 3456))?;
     listener.set_nonblocking(true)?;
     let socket_fd = listener.as_raw_fd();
 
@@ -136,15 +138,9 @@ fn worker(mut ring: IoUring, cpu: u16) -> anyhow::Result<()> {
     buf_ring.register(&submitter)?;
     tracing::debug!(message = "Registered shared buffers");
     let mut state: Slab<ConnectionId, RequestState> = Slab::new(MAX_CONCURRENT_REQUESTS_PER_THREAD);
-
     loop {
         sq.sync();
-        let submit_result = submitter.submit_and_wait(1);
-        match submit_result {
-            Ok(_) => (),
-            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => (),
-            Err(err) => return Err(err.into()),
-        }
+        submitter.submit_and_wait(1)?;
 
         cq.sync();
         tracing::debug!(message = "Working on completions", amount = cq.len());
@@ -355,7 +351,7 @@ However, thread {cpu} attempted to, but got an error {error}.
                 }
             }
         }
-        thread::sleep(Duration::from_millis(1));
+        //thread::sleep(Duration::from_millis(1));
     }
 }
 

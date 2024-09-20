@@ -12,11 +12,13 @@ mod fd;
 mod hoopa;
 mod http2;
 mod hyper;
+mod monoio;
 mod slab;
 mod uring_id;
 
 fn main() -> anyhow::Result<()> {
     hoopa::main().map_err(|err| anyhow::anyhow!(err))?;
     // hyper::main().map_err(|err| anyhow::anyhow!(err))?;
+    //monoio::main();
     Ok(())
 }
