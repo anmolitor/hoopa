@@ -224,31 +224,6 @@ However, thread {cpu} attempted to, but got an error {error}.
                     }
                     tracing::debug!(message = "Successfully parsed request", path = req.path);
 
-                    if req.headers.contains(&httparse::Header {
-                        name: "Upgrade",
-                        value: b"h2c",
-                    }) {
-                        // tracing::debug!("Upgrading to HTTP/2");
-
-                        // let write_entry = opcode::Send::new(
-                        //     types::Fd::from(&connection_fd),
-                        //     RESPONSE_101_UPGRADE_HTTP2.as_ptr(),
-                        //     RESPONSE_101_UPGRADE_HTTP2.len() as _,
-                        // )
-                        // .build()
-                        // .flags(Flags::IO_LINK);
-                        // drop(request_state_entry);
-                        // let slab_id = state.insert(RequestState::ReadHttp2Settings {
-                        //     connection_fd,
-                        //     buf,
-                        //     storage_id,
-                        // })?;
-
-                        // unsafe { sq.push(&write_entry.user_data(0))? };
-                        // unsafe { sq.push(&read_entry)? };
-                        // continue;
-                    }
-
                     let write_entry = opcode::Send::new(
                         types::Fd::from(&request_state.connection_fd),
                         RESPONSE_200_HTTP11.as_ptr(),
@@ -261,85 +236,7 @@ However, thread {cpu} attempted to, but got an error {error}.
                     });
                     unsafe { sq.push(&write_entry)? };
                     tracing::debug!("Writing to socket");
-                } // RequestState::ReadHttp2Settings {
-                //     connection_fd,
-                //     storage_id,
-                //     request_storage_id,
-                // } => {
-                //     tracing::debug!("HTTP/2 settings");
-                //     let buf = &mut buffers[storage_id];
-                //     let Some(buf_without_prefix) = buf.strip_prefix(PREFACE_HTTP2) else {
-                //         anyhow::bail!("Client did not send HTTP/2 preface.");
-                //     };
-                //     let (rest, frame) =
-                //         Frame::parse(buf_without_prefix).expect("Frame parsing failed");
-
-                //     let mut client_settings = Settings::default();
-                //     Settings::parse(&rest[0..frame.len as usize], |code, val| {
-                //         client_settings.apply(code, val)
-                //     })
-                //     .expect("Frame parsing failed");
-
-                //     let setting_pairs = [
-                //         (Setting::EnablePush, 0),
-                //         (Setting::HeaderTableSize, client_settings.header_table_size),
-                //         (
-                //             Setting::InitialWindowSize,
-                //             client_settings.initial_window_size,
-                //         ),
-                //         (
-                //             Setting::MaxConcurrentStreams,
-                //             client_settings.max_concurrent_streams.unwrap_or(u32::MAX),
-                //         ),
-                //         (Setting::MaxFrameSize, client_settings.max_frame_size),
-                //         (
-                //             Setting::MaxHeaderListSize,
-                //             client_settings.max_header_list_size,
-                //         ),
-                //     ];
-
-                //     let server_settings = SettingPairs(&setting_pairs);
-                //     let server_frame =
-                //         Frame::new(FrameType::Settings(Default::default()), frame.stream_id);
-                //     let settings_len = server_settings.calc_size();
-                //     let frame_len = server_frame.with_len(settings_len as _).write_into(buf)?;
-
-                //     server_settings.write(&mut buf[frame_len.into()..])?;
-
-                //     let write_entry = buffers
-                //         .write(
-                //             &connection_fd,
-                //             storage_id,
-                //             frame_len as u32 + settings_len as u32,
-                //         )
-                //         .flags(Flags::IO_LINK)
-                //         .user_data(0);
-                //     // TODO come up with a system to release storage_ids
-                //     let (read_entry, storage_id) = buffers.read(&connection_fd, uring_id)?;
-
-                //     let mut header_flags = BitFlags::default();
-                //     header_flags.insert(HeadersFlags::EndHeaders);
-                //     let headers_frame =
-                //         FrameType::Headers(header_flags).into_frame(frame.stream_id);
-                //     //hpack::Encoder::new().encode_into([], &mut buf[]);
-
-                //     unsafe { sq.push(&write_entry)? };
-                //     unsafe { sq.push(&read_entry)? };
-                //     request_state_entry.set(RequestState::ReadHttp2 {
-                //         connection_fd,
-                //         storage_id,
-                //         request_storage_id,
-                //     });
-                // }
-                // RequestState::ReadHttp2 {
-                //     connection_fd,
-                //     storage_id,
-                //     request_storage_id,
-                // } => {
-                //     let buf = &mut buffers[storage_id];
-                //     let (rest, frame) = Frame::parse(buf).expect("Frame parsing failed");
-                //     println!("Frame {frame:?}");
-                // }
+                }
                 Ok(Completion::Send { length }) => {
                     tracing::debug!(message = "Sent bytes over socket", length);
                     request_state_entry.set(RequestState {
@@ -349,9 +246,20 @@ However, thread {cpu} attempted to, but got an error {error}.
                 Err((OpCode::Send, error)) => {
                     tracing::error!(message = "Unexpected error code", %error);
                 }
+                Ok(Completion::OpenAt { fd }) => {}
+                Err((OpCode::OpenAt, error)) => {
+                    tracing::error!(message = "Unexpected error code", %error);
+                }
+                Ok(Completion::Statx) => {}
+                Err((OpCode::Statx, error)) => {
+                    tracing::error!(message = "Unexpected error code", %error);
+                }
+                Ok(Completion::Splice) => {}
+                Err((OpCode::Splice, error)) => {
+                    tracing::error!(message = "Unexpected error code", %error);
+                }
             }
         }
-        //thread::sleep(Duration::from_millis(1));
     }
 }
 
