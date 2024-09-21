@@ -15,6 +15,8 @@ mod hyper;
 mod monoio;
 mod slab;
 mod uring_id;
+mod uninit;
+mod runtime;
 
 fn main() -> anyhow::Result<()> {
     hoopa::main().map_err(|err| anyhow::anyhow!(err))?;

@@ -14,6 +14,9 @@ pub enum Completion {
     AcceptMulti { connection_fd: Fd },
     RecvMulti(RecvMultiResult),
     Send { length: u32 },
+    OpenAt { fd: Fd },
+    Statx,
+    Splice,
     AsyncCancel,
 }
 
@@ -54,6 +57,11 @@ impl Completion {
                 length: result as u32,
             }),
             OpCode::AsyncCancel => Ok(Completion::AsyncCancel),
+            OpCode::OpenAt => Ok(Completion::OpenAt {
+                fd: unsafe { Fd::from_raw_fd(result) },
+            }),
+            OpCode::Statx => Ok(Completion::Statx),
+            OpCode::Splice => Ok(Completion::Splice),
         }
     }
 }

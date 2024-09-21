@@ -51,6 +51,9 @@ pub enum OpCode {
     RecvMulti = opcode::RecvMulti::CODE,
     Send = opcode::Send::CODE,
     AsyncCancel = opcode::AsyncCancel::CODE,
+    OpenAt = opcode::OpenAt::CODE,
+    Statx = opcode::Statx::CODE,
+    Splice = opcode::Splice::CODE,
 }
 
 pub struct UringIdOutOfRange<T>(T);
@@ -181,6 +184,36 @@ impl Op for opcode::AsyncCancel {
     }
 }
 
+impl Op for opcode::Splice {
+    fn code() -> OpCode {
+        OpCode::Splice
+    }
+
+    fn build(self) -> squeue::Entry {
+        self.build()
+    }
+}
+
+impl Op for opcode::Statx {
+    fn code() -> OpCode {
+        OpCode::Statx
+    }
+
+    fn build(self) -> squeue::Entry {
+        self.build()
+    }
+}
+
+impl Op for opcode::OpenAt {
+    fn code() -> OpCode {
+        OpCode::OpenAt
+    }
+
+    fn build(self) -> squeue::Entry {
+        self.build()
+    }
+}
+
 impl Display for ConnectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         u16::fmt(&self.0, f)
@@ -200,6 +233,9 @@ impl Display for OpCode {
             OpCode::AsyncCancel => "AsyncCancel",
             OpCode::RecvMulti => "RecvMulti",
             OpCode::Send => "Send",
+            OpCode::OpenAt => "OpenAt",
+            OpCode::Statx => "Statx",
+            OpCode::Splice => "Splice",
         };
         f.write_str(str_repr)
     }

@@ -19,11 +19,11 @@ Rough architecture:
       |                 | ---------------> |          |         |      N      |        
       |                 | <--------------- |          |         |      E      |        
       |                 |   HTTP Request   |          |         |      L      |                                    
-      |                 | OpenFile & Statx |          |         |             |        
+      |                 |  OpenAt & Statx  |          |         |             |        
       |  Worker thread  | ---------------> | IO_URING | <-----> |             |        
       |                 | <--------------- |          |         |             |        
       |                 |  File Descriptor |          |         |             |        
-      |               ReadFixed & Splice & Send       |         |             |        
+      |                 |   Splice & Send  |         |             |        
       |                 | ---------------> |          |         |             |        
       |_________________| <--------------- |__________|         |_____________|                 
                               Success!
