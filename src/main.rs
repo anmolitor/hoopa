@@ -7,16 +7,20 @@
 //     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // }
 mod buf;
+mod bump;
 mod completion_result;
 mod fd;
 mod hoopa;
 mod http2;
 mod hyper;
+mod io;
 mod monoio;
-mod slab;
-mod uring_id;
-mod uninit;
+mod pic;
+mod picol;
 mod runtime;
+mod slab;
+mod uninit;
+mod uring_id;
 
 fn main() -> anyhow::Result<()> {
     hoopa::main().map_err(|err| anyhow::anyhow!(err))?;

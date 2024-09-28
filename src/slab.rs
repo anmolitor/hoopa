@@ -1,8 +1,11 @@
-use std::{fmt::Display, marker::PhantomData};
+use std::{
+    fmt::{Debug, Display},
+    marker::PhantomData,
+};
 
 #[derive(Debug)]
 pub struct Slab<K, T> {
-    storage: Vec<Option<T>>,
+    storage: Box<[T]>,
     next: u16,
     free_list: Vec<u16>,
     _key_type: PhantomData<K>,
@@ -23,44 +26,20 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
-#[must_use]
-pub struct Entry<'a, K, T>
-where
-    K: Into<u16> + Copy,
-{
-    key: K,
-    slab: &'a mut Slab<K, T>,
-    set: bool,
+pub trait Reset {
+    fn reset(&mut self);
 }
 
-impl<'a, K, T> Entry<'a, K, T>
+impl<K, T> Slab<K, T>
 where
-    K: Into<u16> + Copy,
+    T: Default + Reset,
+    K: From<u16> + Into<u16> + Copy,
 {
-    pub fn set(mut self, value: T) {
-        self.slab.storage[Into::<u16>::into(self.key) as usize] = Some(value);
-        self.set = true;
-    }
-}
-
-impl<'a, K, T> Drop for Entry<'a, K, T>
-where
-    K: Into<u16> + Copy,
-{
-    fn drop(&mut self) {
-        if self.set {
-            return;
-        }
-        self.slab.remove(self.key);
-    }
-}
-
-impl<K, T> Slab<K, T> {
     pub fn new(capacity: u16) -> Self {
         if capacity == 0 {
             panic!("capacity should be at least one.");
         }
-        let storage: Vec<Option<T>> = std::iter::repeat_with(|| None)
+        let storage: Box<[T]> = std::iter::repeat_with(|| Default::default())
             .take(capacity as _)
             .collect();
 
@@ -72,57 +51,22 @@ impl<K, T> Slab<K, T> {
         }
     }
 
-    pub fn insert(&mut self, value: T) -> Result<K, Error>
-    where
-        K: From<u16>,
-    {
+    pub fn reserve(&mut self) -> Result<(K, &mut T), Error> {
         let id = self.next()?;
-        self.storage[id as usize] = Some(value);
-        Ok(K::from(id))
-    }
-
-    pub fn reserve(&mut self) -> Result<(K, Entry<K, T>), Error>
-    where
-        K: From<u16> + Into<u16> + Copy,
-    {
-        let id = self.next()?;
-
+        let value = &mut self.storage[id as usize];
         let key = K::from(id);
-        Ok((
-            key,
-            Entry {
-                key,
-                slab: self,
-                set: false,
-            },
-        ))
+        Ok((key, value))
     }
 
-    pub fn remove(&mut self, key: K) -> Option<T>
-    where
-        K: Into<u16> + Copy,
-    {
-        let key = Into::<u16>::into(key);
-        let value = self.storage.get_mut(key as usize)?;
-        self.free_list.push(key);
-        value.take()
-    }
-
-    pub fn entry(&mut self, key: K) -> Option<(T, Entry<K, T>)>
-    where
-        K: Into<u16> + Copy,
-    {
+    pub fn get_mut(&mut self, key: K) -> &mut T {
         let k = Into::<u16>::into(key);
-        let value = self.storage.get_mut(k as usize)?;
-        let value = value.take()?;
-        Some((
-            value,
-            Entry {
-                key,
-                slab: self,
-                set: false,
-            },
-        ))
+        &mut self.storage[k as usize]
+    }
+
+    pub fn reset(&mut self, key: K) {
+        let k = Into::<u16>::into(key);
+        self.free_list.push(k);
+        self.storage[k as usize].reset();
     }
 
     fn next(&mut self) -> Result<u16, Error> {

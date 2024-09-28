@@ -26,6 +26,9 @@ tracing-subscriber = { version = "0.3.18" }
 hpack = "0.3"
 num_enum = "0.7.3"
 nom = { version = "7.1.3", default-features = false }
+socket2 = "0.5.7"
+moka = { version = "0.12.8", features = ["sync"] }
+gxhash = "3.4.1"
 
 # hyper/tokio version
 bytes = "1.7.2"
@@ -36,3 +39,14 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 futures = "0.3.30"
 monoio-compat = { version = "0.2.2", features = ["hyper"] }
+
+# picol
+async-task = "4"
+flume = "0.10.14"
+futures-lite = "1"
+once_cell = "1"
+arrayvec = "0.7.6"
+ouroboros = "0.18.4"
+
+[dev-dependencies]
+rand = "0.8.5"
